@@ -12,6 +12,7 @@ import random
 
 import boto3
 from botocore.exceptions import ClientError
+from fastapi.responses import JSONResponse
 
 # Configure structured JSON logging
 class JSONFormatter(logging.Formatter):
@@ -341,24 +342,6 @@ def retry_with_backoff(
     raise last_exception
 
 
-def log_api_request(event: Dict[str, Any], response: Dict[str, Any], duration_ms: float):
-    """Log API request with structured data."""
-    log_entry = {
-        'timestamp': datetime.utcnow().isoformat(),
-        'requestId': event.get('requestContext', {}).get('requestId'),
-        'sourceIp': event.get('requestContext', {}).get('identity', {}).get('sourceIp'),
-        'userAgent': event.get('requestContext', {}).get('identity', {}).get('userAgent'),
-        'httpMethod': event.get('httpMethod'),
-        'path': event.get('path'),
-        'statusCode': response.get('statusCode'),
-        'durationMs': duration_ms,
-        'sessionId': event.get('headers', {}).get('X-Session-Id'),
-        'error': response.get('body', {}).get('error') if isinstance(response.get('body'), dict) else None
-    }
-    
-    logger.info(json.dumps(log_entry))
-
-
 def log_security_event(event_type: str, details: Dict[str, Any]):
     """Log security-related events."""
     log_entry = {
@@ -376,9 +359,9 @@ def create_response(
     body: Dict[str, Any],
     headers: Optional[Dict[str, str]] = None,
     cache_control: Optional[str] = None
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """
-    Create a standardized API Gateway response with optional caching.
+    Create a standardized FastAPI JSONResponse with optional caching.
     
     Args:
         status_code: HTTP status code
@@ -387,7 +370,7 @@ def create_response(
         cache_control: Optional Cache-Control header value
     
     Returns:
-        API Gateway response dictionary
+        FastAPI JSONResponse object
     """
     default_headers = {
         'Content-Type': 'application/json',
@@ -403,11 +386,11 @@ def create_response(
     if headers:
         default_headers.update(headers)
     
-    return {
-        'statusCode': status_code,
-        'headers': default_headers,
-        'body': json.dumps(body)
-    }
+    return JSONResponse(
+        status_code=status_code,
+        content=body,
+        headers=default_headers
+    )
 
 
 def create_error_response(
@@ -417,7 +400,7 @@ def create_error_response(
     field: Optional[str] = None,
     request_id: Optional[str] = None,
     retry_after: Optional[int] = None
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """
     Create a standardized error response.
     
@@ -430,7 +413,7 @@ def create_error_response(
         retry_after: Optional retry delay in seconds
     
     Returns:
-        API Gateway error response dictionary
+        FastAPI JSONResponse error object
     """
     error_body = {
         'error': error_type,
@@ -446,192 +429,6 @@ def create_error_response(
         error_body['retryAfter'] = retry_after
     
     return create_response(status_code, error_body)
-
-
-def handle_exceptions(func: Callable) -> Callable:
-    """
-    Decorator to handle exceptions in Lambda handlers.
-    
-    Catches exceptions and returns appropriate error responses.
-    Adds correlation ID for request tracing and structured logging.
-    """
-    @wraps(func)
-    def wrapper(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-        start_time = time.time()
-        
-        # Generate correlation ID for this request
-        correlation_id = get_correlation_id()
-        request_id = event.get('requestContext', {}).get('requestId', 'unknown')
-        session_id = get_session_id_from_event(event)
-        
-        # Log request start
-        log_with_context(
-            'INFO',
-            f'Request started: {event.get("httpMethod")} {event.get("path")}',
-            correlation_id=correlation_id,
-            request_id=request_id,
-            session_id=session_id,
-            extra_data={
-                'httpMethod': event.get('httpMethod'),
-                'path': event.get('path'),
-                'sourceIp': event.get('requestContext', {}).get('identity', {}).get('sourceIp')
-            }
-        )
-        
-        try:
-            # Store correlation ID in event for use in handler
-            event['correlationId'] = correlation_id
-            
-            response = func(event, context)
-            duration_ms = (time.time() - start_time) * 1000
-            
-            # Log successful request completion
-            log_with_context(
-                'INFO',
-                f'Request completed successfully: {event.get("httpMethod")} {event.get("path")}',
-                correlation_id=correlation_id,
-                request_id=request_id,
-                session_id=session_id,
-                duration_ms=duration_ms,
-                extra_data={
-                    'statusCode': response.get('statusCode'),
-                    'httpMethod': event.get('httpMethod'),
-                    'path': event.get('path')
-                }
-            )
-            
-            return response
-            
-        except ValueError as e:
-            duration_ms = (time.time() - start_time) * 1000
-            
-            log_with_context(
-                'WARNING',
-                f'Validation error: {str(e)}',
-                correlation_id=correlation_id,
-                request_id=request_id,
-                session_id=session_id,
-                duration_ms=duration_ms,
-                extra_data={
-                    'errorType': 'ValidationError',
-                    'errorMessage': str(e)
-                }
-            )
-            
-            return create_error_response(
-                400,
-                'ValidationError',
-                str(e),
-                request_id=request_id
-            )
-            
-        except ClientError as e:
-            duration_ms = (time.time() - start_time) * 1000
-            error_code = e.response['Error']['Code']
-            error_message = e.response['Error']['Message']
-            
-            log_with_context(
-                'ERROR',
-                f'AWS service error: {error_code} - {error_message}',
-                correlation_id=correlation_id,
-                request_id=request_id,
-                session_id=session_id,
-                duration_ms=duration_ms,
-                extra_data={
-                    'errorType': 'ClientError',
-                    'errorCode': error_code,
-                    'errorMessage': error_message,
-                    'service': e.response.get('ResponseMetadata', {}).get('HTTPHeaders', {}).get('x-amzn-requestid')
-                }
-            )
-            
-            if error_code == 'ResourceNotFoundException':
-                return create_error_response(
-                    404,
-                    'ResourceNotFound',
-                    'The requested resource was not found',
-                    request_id=request_id
-                )
-            else:
-                return create_error_response(
-                    500,
-                    'ServiceError',
-                    'An error occurred while processing your request. Please try again.',
-                    request_id=request_id
-                )
-                
-        except Exception as e:
-            duration_ms = (time.time() - start_time) * 1000
-            
-            # Log with full stack trace
-            log_with_context(
-                'ERROR',
-                f'Unexpected error: {str(e)}',
-                correlation_id=correlation_id,
-                request_id=request_id,
-                session_id=session_id,
-                duration_ms=duration_ms,
-                extra_data={
-                    'errorType': type(e).__name__,
-                    'errorMessage': str(e)
-                }
-            )
-            
-            # Log stack trace separately
-            logger.exception(
-                'Stack trace for unexpected error',
-                extra={
-                    'correlation_id': correlation_id,
-                    'request_id': request_id
-                }
-            )
-            
-            return create_error_response(
-                500,
-                'InternalError',
-                'An unexpected error occurred. Please try again.',
-                request_id=request_id
-            )
-    
-    return wrapper
-
-
-def parse_request_body(event: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Parse and validate request body from API Gateway event.
-    
-    Args:
-        event: API Gateway event dictionary
-    
-    Returns:
-        Parsed request body dictionary
-    
-    Raises:
-        ValueError: If body is missing or invalid JSON
-    """
-    body = event.get('body')
-    
-    if not body:
-        raise ValueError("Request body is required")
-    
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in request body: {e}")
-
-
-def get_session_id_from_event(event: Dict[str, Any]) -> Optional[str]:
-    """
-    Extract session ID from API Gateway event headers.
-    
-    Args:
-        event: API Gateway event dictionary
-    
-    Returns:
-        Session ID if present, None otherwise
-    """
-    headers = event.get('headers', {})
-    return headers.get('X-Session-Id') or headers.get('x-session-id')
 
 
 def sanitize_html(text: str) -> str:

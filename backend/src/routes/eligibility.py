@@ -1,11 +1,13 @@
-"""Eligibility Check Lambda function handler."""
+"""Eligibility route handler for FastAPI."""
 
-import json
 import os
 import sys
-from typing import Any, Dict, List, Tuple, Callable, Optional
 import operator
 import re
+from typing import Any, Dict, List, Tuple, Callable, Optional
+
+from fastapi import APIRouter, Request, status
+from fastapi.responses import JSONResponse
 
 # Add shared module to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -18,12 +20,9 @@ from shared.models import (
     SchemeDetails
 )
 from shared.utils import (
-    handle_exceptions,
-    parse_request_body,
     get_dynamodb_table,
-    create_response,
-    create_error_response,
     validate_scheme_id,
+    get_current_timestamp,
     logger
 )
 from shared.data_privacy import (
@@ -31,6 +30,9 @@ from shared.data_privacy import (
     validate_data_minimization,
     log_data_access
 )
+
+# Create router
+router = APIRouter()
 
 
 class EligibilityRule:
@@ -341,105 +343,127 @@ class SchemeRules:
         }
 
 
-@handle_exceptions
-@handle_exceptions
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+@router.post("/eligibility", status_code=status.HTTP_200_OK)
+async def check_eligibility(
+    request: Request,
+    eligibility_request: EligibilityRequest
+):
     """
     Check scheme eligibility using rule-based logic.
     
-    This function implements a transparent, rule-based eligibility engine
+    This endpoint implements a transparent, rule-based eligibility engine
     that evaluates user information against scheme criteria without using
     AI inference. All decisions are deterministic and explainable.
     
     Args:
-        event: API Gateway event containing eligibility check request
-        context: Lambda context object
+        request: FastAPI Request object
+        eligibility_request: Validated EligibilityRequest from request body
     
     Returns:
-        API Gateway response with eligibility result including:
+        EligibilityResponse with eligibility result including:
         - eligible: Boolean indicating eligibility status
         - explanation: Detailed breakdown of each criterion
         - schemeDetails: Information about the scheme and application process
         - alternativeSchemes: Suggestions if not eligible
     """
-    logger.info("Processing eligibility check request")
+    # Get correlation ID from request state (set by middleware)
+    correlation_id = getattr(request.state, 'correlation_id', None)
     
-    # Parse and validate request
-    body = parse_request_body(event)
+    logger.info("Processing eligibility check request", extra={'correlation_id': correlation_id})
     
     # Validate scheme ID
-    scheme_id = validate_scheme_id(body.get('schemeId', ''))
+    try:
+        scheme_id = validate_scheme_id(eligibility_request.schemeId)
+    except ValueError as e:
+        error_body = {
+            'error': 'ValidationError',
+            'message': str(e),
+            'field': 'schemeId',
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=error_body
+        )
     
     # Get user info and apply data minimization
-    user_info_raw = body.get('userInfo', {})
+    user_info_raw = eligibility_request.userInfo.dict()
     
     # Anonymize and filter user info to essential fields only
     user_info_anonymized = anonymize_user_info(user_info_raw)
     
     # Validate data minimization compliance
     if not validate_data_minimization(user_info_anonymized):
-        logger.error("Data minimization validation failed")
-        return create_error_response(
-            400,
-            'DataPrivacyViolation',
-            'User information contains prohibited fields',
-            request_id=event.get('requestContext', {}).get('requestId')
+        logger.error("Data minimization validation failed", extra={'correlation_id': correlation_id})
+        error_body = {
+            'error': 'DataPrivacyViolation',
+            'message': 'User information contains prohibited fields',
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=error_body
         )
     
     # Log data access for audit
+    session_id = request.headers.get('X-Session-Id', 'unknown')
     log_data_access(
         operation='read',
         data_type='user_info',
-        session_id=event.get('headers', {}).get('X-Session-Id', 'unknown'),
+        session_id=session_id,
         fields_accessed=list(user_info_anonymized.keys())
     )
     
-    # Create validated request with anonymized data
-    request = EligibilityRequest(schemeId=scheme_id, userInfo=user_info_anonymized)
-    
-    logger.info(f"Checking eligibility for scheme: {request.schemeId}")
+    logger.info(f"Checking eligibility for scheme: {scheme_id}", extra={'correlation_id': correlation_id})
     
     # Get scheme from DynamoDB
     table = get_dynamodb_table()
-    scheme = get_scheme(table, request.schemeId)
+    scheme = get_scheme(table, scheme_id)
     
     if not scheme:
-        logger.warning(f"Scheme not found: {request.schemeId}")
-        return create_error_response(
-            404,
-            'SchemeNotFound',
-            f"Scheme with ID '{request.schemeId}' does not exist",
-            request_id=event.get('requestContext', {}).get('requestId')
+        logger.warning(f"Scheme not found: {scheme_id}", extra={'correlation_id': correlation_id})
+        error_body = {
+            'error': 'SchemeNotFound',
+            'message': f"Scheme with ID '{scheme_id}' does not exist",
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=error_body
         )
     
     # Build scheme rules engine
-    scheme_rules = SchemeRules(request.schemeId)
+    scheme_rules = SchemeRules(scheme_id)
     
     # Load eligibility rules
     eligibility_rules = scheme.get('eligibilityRules', [])
     if not eligibility_rules:
-        logger.warning(f"No eligibility rules found for scheme: {request.schemeId}")
-        return create_error_response(
-            500,
-            'ConfigurationError',
-            f"Scheme '{request.schemeId}' has no eligibility rules configured",
-            request_id=event.get('requestContext', {}).get('requestId')
+        logger.warning(f"No eligibility rules found for scheme: {scheme_id}", extra={'correlation_id': correlation_id})
+        error_body = {
+            'error': 'ConfigurationError',
+            'message': f"Scheme '{scheme_id}' has no eligibility rules configured",
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=error_body
         )
     
     for rule_dict in eligibility_rules:
         scheme_rules.add_rule_from_dict(rule_dict)
     
-    logger.info(f"Loaded {len(scheme_rules.rules)} eligibility rules")
+    logger.info(f"Loaded {len(scheme_rules.rules)} eligibility rules", extra={'correlation_id': correlation_id})
     
     # Evaluate all eligibility rules
-    evaluation_result = scheme_rules.evaluate_all(request.userInfo.dict())
+    evaluation_result = scheme_rules.evaluate_all(user_info_anonymized)
     
     eligible = evaluation_result['eligible']
     criteria_results = evaluation_result['criteria']
     
     logger.info(
         f"Eligibility evaluation complete: eligible={eligible}, "
-        f"met={evaluation_result['met_count']}/{evaluation_result['total_count']}"
+        f"met={evaluation_result['met_count']}/{evaluation_result['total_count']}",
+        extra={'correlation_id': correlation_id}
     )
     
     # Generate comprehensive explanation
@@ -461,15 +485,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Get alternative schemes if not eligible
     alternative_schemes = None
     if not eligible:
-        logger.info("User not eligible, fetching alternative schemes")
+        logger.info("User not eligible, fetching alternative schemes", extra={'correlation_id': correlation_id})
         alternative_schemes = get_alternative_schemes(
             table,
             scheme.get('category', ''),
-            request.schemeId
+            scheme_id
         )
         
         if alternative_schemes:
-            logger.info(f"Found {len(alternative_schemes)} alternative schemes")
+            logger.info(f"Found {len(alternative_schemes)} alternative schemes", extra={'correlation_id': correlation_id})
     
     # Create response
     response = EligibilityResponse(
@@ -479,8 +503,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         alternativeSchemes=alternative_schemes
     )
     
-    logger.info("Eligibility check completed successfully")
-    return create_response(200, response.dict())
+    logger.info("Eligibility check completed successfully", extra={'correlation_id': correlation_id})
+    return response.dict()
 
 
 def get_scheme(table, scheme_id: str) -> Optional[Dict[str, Any]]:

@@ -1,63 +1,30 @@
-"""Schemes Lambda function handler."""
+"""Schemes route handler for FastAPI."""
 
-import json
 import os
 import sys
 import time
 from typing import Any, Dict, List, Optional
 
+from fastapi import APIRouter, Query, Request, status
+from fastapi.responses import JSONResponse
+
 # Add shared module to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from shared.utils import (
-    handle_exceptions,
     get_dynamodb_table,
-    create_response,
-    create_error_response,
+    get_current_timestamp,
+    validate_language_code,
     logger
 )
 
-# Lambda memory cache with 5-minute TTL
+# Create router
+router = APIRouter()
+
+# Module-level cache with 5-minute TTL
 _scheme_cache: Dict[str, Any] = {}
 _cache_timestamp: float = 0
 CACHE_TTL_SECONDS = 300  # 5 minutes
-
-
-@handle_exceptions
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """
-    Retrieve scheme information.
-    
-    Handles:
-    - GET /schemes - List all schemes with pagination and category filtering
-    - GET /schemes/{schemeId} - Get specific scheme details with translations
-    
-    Features:
-    - Lambda memory caching with 5-minute TTL
-    - Efficient pagination with DynamoDB LastEvaluatedKey
-    - Category filtering using GSI
-    - Translation support for scheme names and descriptions
-    
-    Args:
-        event: API Gateway event
-        context: Lambda context
-    
-    Returns:
-        API Gateway response with scheme data
-    """
-    http_method = event.get('httpMethod')
-    path_parameters = event.get('pathParameters') or {}
-    query_parameters = event.get('queryStringParameters') or {}
-    
-    table = get_dynamodb_table()
-    
-    # Route based on path
-    if path_parameters.get('schemeId'):
-        # GET /schemes/{schemeId}
-        return get_scheme_details(table, path_parameters['schemeId'], query_parameters, event)
-    else:
-        # GET /schemes
-        return list_schemes(table, query_parameters)
 
 
 def is_cache_valid() -> bool:
@@ -100,7 +67,14 @@ def set_cached_scheme(scheme_id: str, scheme: Dict[str, Any]):
     logger.info(f"Cached scheme {scheme_id}")
 
 
-def list_schemes(table, query_params: Dict[str, str]) -> Dict[str, Any]:
+@router.get("/schemes", status_code=status.HTTP_200_OK)
+async def list_schemes(
+    request: Request,
+    category: Optional[str] = Query(None, description="Filter by category"),
+    limit: int = Query(50, ge=1, le=100, description="Number of results"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    language: str = Query('en', description="Language for translations")
+):
     """
     List all schemes with optional filtering and pagination.
     
@@ -108,17 +82,28 @@ def list_schemes(table, query_params: Dict[str, str]) -> Dict[str, Any]:
     - category: Filter by category (uses GSI)
     - limit: Number of results (default: 50, max: 100)
     - offset: Pagination offset (default: 0)
-    - language: Language for translations (optional)
+    - language: Language for translations (default: en)
     
     Features:
-    - Lambda memory caching with 5-minute TTL
+    - Memory caching with 5-minute TTL
     - Efficient pagination using DynamoDB pagination tokens
     - Category filtering using GSI
     """
-    category = query_params.get('category')
-    limit = min(int(query_params.get('limit', 50)), 100)
-    offset = int(query_params.get('offset', 0))
-    language = query_params.get('language', 'en')
+    # Validate language code
+    try:
+        language = validate_language_code(language)
+    except ValueError as e:
+        error_body = {
+            'error': 'ValidationError',
+            'message': str(e),
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=error_body
+        )
+    
+    table = get_dynamodb_table()
     
     try:
         # Check cache first for non-filtered requests
@@ -131,12 +116,18 @@ def list_schemes(table, query_params: Dict[str, str]) -> Dict[str, Any]:
                     apply_translations(scheme, language) for scheme in paginated_schemes
                 ]
                 
-                return create_response(200, {
+                response_body = {
                     'schemes': schemes_with_translations,
                     'total': len(cached_schemes),
                     'limit': limit,
                     'offset': offset
-                }, cache_control='public, max-age=3600')  # 1 hour cache
+                }
+                
+                return JSONResponse(
+                    status_code=status.HTTP_200_OK,
+                    content=response_body,
+                    headers={'Cache-Control': 'public, max-age=3600'}  # 1 hour cache
+                )
         
         # Fetch from DynamoDB
         if category:
@@ -199,42 +190,76 @@ def list_schemes(table, query_params: Dict[str, str]) -> Dict[str, Any]:
         }
         
         # Add cache-control header: 1 hour for scheme list
-        return create_response(200, response_body, cache_control='public, max-age=3600')
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=response_body,
+            headers={'Cache-Control': 'public, max-age=3600'}
+        )
         
     except Exception as e:
-        logger.error(f"Failed to list schemes: {e}")
-        return create_error_response(
-            500,
-            'InternalError',
-            'Failed to retrieve schemes'
+        logger.error(f"Failed to list schemes: {e}", exc_info=True)
+        error_body = {
+            'error': 'InternalError',
+            'message': 'Failed to retrieve schemes',
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=error_body
         )
 
 
-def get_scheme_details(table, scheme_id: str, query_params: Dict[str, str], event: Dict[str, Any]) -> Dict[str, Any]:
+@router.get("/schemes/{schemeId}", status_code=status.HTTP_200_OK)
+async def get_scheme_details(
+    request: Request,
+    schemeId: str,
+    language: str = Query('en', description="Language for translations")
+):
     """
     Get detailed information about a specific scheme.
     
     Query parameters:
-    - language: Language for translations (optional, default: en)
+    - language: Language for translations (default: en)
     
     Features:
-    - Lambda memory caching with 5-minute TTL
+    - Memory caching with 5-minute TTL
     - Translation support for scheme names and descriptions
     """
-    language = query_params.get('language', 'en')
+    # Validate language code
+    try:
+        language = validate_language_code(language)
+    except ValueError as e:
+        error_body = {
+            'error': 'ValidationError',
+            'message': str(e),
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=error_body
+        )
+    
+    # Get correlation ID from request state (set by middleware)
+    correlation_id = getattr(request.state, 'correlation_id', None)
+    
+    table = get_dynamodb_table()
     
     try:
         # Check cache first
-        cached_scheme = get_cached_scheme(scheme_id)
+        cached_scheme = get_cached_scheme(schemeId)
         if cached_scheme:
             scheme_with_translation = apply_translations(cached_scheme, language)
             # Add cache-control header: 24 hours for scheme details
-            return create_response(200, scheme_with_translation, cache_control='public, max-age=86400')
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=scheme_with_translation,
+                headers={'Cache-Control': 'public, max-age=86400'}
+            )
         
         # Fetch from DynamoDB
         response = table.get_item(
             Key={
-                'PK': f'SCHEME#{scheme_id}',
+                'PK': f'SCHEME#{schemeId}',
                 'SK': 'METADATA'
             }
         )
@@ -242,31 +267,43 @@ def get_scheme_details(table, scheme_id: str, query_params: Dict[str, str], even
         item = response.get('Item')
         
         if not item:
-            return create_error_response(
-                404,
-                'SchemeNotFound',
-                f"Scheme with ID '{scheme_id}' does not exist",
-                request_id=event.get('requestContext', {}).get('requestId')
+            error_body = {
+                'error': 'SchemeNotFound',
+                'message': f"Scheme with ID '{schemeId}' does not exist",
+                'requestId': correlation_id,
+                'timestamp': get_current_timestamp()
+            }
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content=error_body
             )
         
         # Format scheme details
         scheme_details = format_scheme_details(item)
         
         # Cache the scheme
-        set_cached_scheme(scheme_id, scheme_details)
+        set_cached_scheme(schemeId, scheme_details)
         
         # Apply translations
         scheme_with_translation = apply_translations(scheme_details, language)
         
         # Add cache-control header: 24 hours for scheme details
-        return create_response(200, scheme_with_translation, cache_control='public, max-age=86400')
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=scheme_with_translation,
+            headers={'Cache-Control': 'public, max-age=86400'}
+        )
         
     except Exception as e:
-        logger.error(f"Failed to get scheme details: {e}")
-        return create_error_response(
-            500,
-            'InternalError',
-            'Failed to retrieve scheme details'
+        logger.error(f"Failed to get scheme details: {e}", exc_info=True)
+        error_body = {
+            'error': 'InternalError',
+            'message': 'Failed to retrieve scheme details',
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=error_body
         )
 
 

@@ -1,4 +1,4 @@
-"""Chat Lambda function handler."""
+"""Chat route handler for FastAPI."""
 
 import json
 import os
@@ -6,24 +6,21 @@ import re
 import sys
 import time
 from typing import Any, Dict, List, Optional
-from functools import wraps
+
+from fastapi import APIRouter, Header, Request, status
+from fastapi.responses import JSONResponse
 
 # Add shared module to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from shared.models import ChatRequest, ChatResponse, SchemeCard
 from shared.utils import (
-    handle_exceptions,
-    parse_request_body,
-    get_session_id_from_event,
     generate_session_id,
     get_current_timestamp,
     get_ttl_timestamp,
     get_dynamodb_table,
     get_bedrock_client,
     get_translate_client,
-    create_response,
-    create_error_response,
     retry_with_backoff,
     log_security_event,
     sanitize_input,
@@ -33,11 +30,14 @@ from shared.utils import (
 from shared.session_manager import get_session_info
 from shared.data_privacy import sanitize_message_content, detect_pii
 
+# Create router
+router = APIRouter()
+
 # Rate limiting configuration
 RATE_LIMIT_REQUESTS = 10
 RATE_LIMIT_WINDOW = 60  # seconds
 
-# Lambda memory cache for scheme data (5-minute TTL)
+# Module-level cache for scheme data (5-minute TTL)
 _schemes_cache: List[Dict[str, Any]] = []
 _schemes_cache_timestamp: float = 0
 SCHEMES_CACHE_TTL = 300  # 5 minutes
@@ -56,7 +56,7 @@ def is_schemes_cache_valid() -> bool:
 def get_cached_schemes() -> Optional[List[Dict[str, Any]]]:
     """Get schemes from cache if valid."""
     if is_schemes_cache_valid() and _schemes_cache:
-        logger.info("Returning schemes from Lambda memory cache")
+        logger.info("Returning schemes from memory cache")
         return _schemes_cache
     return None
 
@@ -66,7 +66,7 @@ def set_cached_schemes(schemes: List[Dict[str, Any]]):
     global _schemes_cache, _schemes_cache_timestamp
     _schemes_cache = schemes
     _schemes_cache_timestamp = time.time()
-    logger.info(f"Cached {len(schemes)} schemes in Lambda memory")
+    logger.info(f"Cached {len(schemes)} schemes in memory")
 
 
 def get_cached_query_result(cache_key: str) -> Optional[Any]:
@@ -86,117 +86,133 @@ def set_cached_query_result(cache_key: str, result: Any):
     logger.info(f"Cached query result: {cache_key}")
 
 
-# Rate limiting configuration
-RATE_LIMIT_REQUESTS = 10
-RATE_LIMIT_WINDOW = 60  # seconds
-
-
-def rate_limit(func):
+def check_rate_limit(source_ip: str) -> Optional[JSONResponse]:
     """
-    Rate limiting decorator: 10 requests per 60 seconds per IP.
+    Check rate limit: 10 requests per 60 seconds per IP.
     
     Uses DynamoDB to track request counts per IP address.
-    """
-    @wraps(func)
-    def wrapper(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-        # Get source IP
-        source_ip = event.get('requestContext', {}).get('identity', {}).get('sourceIp', 'unknown')
-        
-        if source_ip == 'unknown':
-            logger.warning("Could not determine source IP for rate limiting")
-            return func(event, context)
-        
-        # Check rate limit
-        table = get_dynamodb_table()
-        current_time = get_current_timestamp()
-        rate_limit_key = f'RATELIMIT#{source_ip}'
-        
-        try:
-            # Get current request count
-            response = table.get_item(
-                Key={
-                    'PK': rate_limit_key,
-                    'SK': 'COUNTER'
-                }
-            )
-            
-            item = response.get('Item', {})
-            request_count = item.get('requestCount', 0)
-            window_start = item.get('windowStart', current_time)
-            
-            # Check if window has expired
-            if current_time - window_start >= RATE_LIMIT_WINDOW:
-                # Reset window
-                request_count = 0
-                window_start = current_time
-            
-            # Check if rate limit exceeded
-            if request_count >= RATE_LIMIT_REQUESTS:
-                time_remaining = RATE_LIMIT_WINDOW - (current_time - window_start)
-                
-                log_security_event('RateLimitExceeded', {
-                    'sourceIp': source_ip,
-                    'requestCount': request_count,
-                    'timeRemaining': time_remaining
-                })
-                
-                return create_error_response(
-                    429,
-                    'RateLimitExceeded',
-                    f'Too many requests. Please try again in {time_remaining} seconds.',
-                    retry_after=time_remaining
-                )
-            
-            # Increment request count
-            table.put_item(
-                Item={
-                    'PK': rate_limit_key,
-                    'SK': 'COUNTER',
-                    'requestCount': request_count + 1,
-                    'windowStart': window_start,
-                    'ttl': get_ttl_timestamp(1)  # Clean up after 1 hour
-                }
-            )
-            
-        except Exception as e:
-            logger.error(f"Rate limiting check failed: {e}")
-            # Continue processing if rate limiting fails
-        
-        return func(event, context)
     
-    return wrapper
+    Args:
+        source_ip: Source IP address
+    
+    Returns:
+        JSONResponse with 429 status if rate limit exceeded, None otherwise
+    """
+    if source_ip == 'unknown':
+        logger.warning("Could not determine source IP for rate limiting")
+        return None
+    
+    table = get_dynamodb_table()
+    current_time = get_current_timestamp()
+    rate_limit_key = f'RATELIMIT#{source_ip}'
+    
+    try:
+        # Get current request count
+        response = table.get_item(
+            Key={
+                'PK': rate_limit_key,
+                'SK': 'COUNTER'
+            }
+        )
+        
+        item = response.get('Item', {})
+        request_count = item.get('requestCount', 0)
+        window_start = item.get('windowStart', current_time)
+        
+        # Check if window has expired
+        if current_time - window_start >= RATE_LIMIT_WINDOW:
+            # Reset window
+            request_count = 0
+            window_start = current_time
+        
+        # Check if rate limit exceeded
+        if request_count >= RATE_LIMIT_REQUESTS:
+            time_remaining = RATE_LIMIT_WINDOW - (current_time - window_start)
+            
+            log_security_event('RateLimitExceeded', {
+                'sourceIp': source_ip,
+                'requestCount': request_count,
+                'timeRemaining': time_remaining
+            })
+            
+            error_body = {
+                'error': 'RateLimitExceeded',
+                'message': f'Too many requests. Please try again in {time_remaining} seconds.',
+                'timestamp': current_time,
+                'retryAfter': time_remaining
+            }
+            
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content=error_body,
+                headers={'Retry-After': str(time_remaining)}
+            )
+        
+        # Increment request count
+        table.put_item(
+            Item={
+                'PK': rate_limit_key,
+                'SK': 'COUNTER',
+                'requestCount': request_count + 1,
+                'windowStart': window_start,
+                'ttl': get_ttl_timestamp(1)  # Clean up after 1 hour
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Rate limiting check failed: {e}")
+        # Continue processing if rate limiting fails
+    
+    return None
 
 
-@rate_limit
-@handle_exceptions
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+@router.post("/chat", status_code=status.HTTP_200_OK)
+async def chat(
+    request: Request,
+    chat_request: ChatRequest,
+    x_session_id: Optional[str] = Header(None, alias="X-Session-Id")
+):
     """
     Process text-based chat queries with AI.
     
     Args:
-        event: API Gateway event
-        context: Lambda context
+        request: FastAPI Request object
+        chat_request: Validated ChatRequest from request body
+        x_session_id: Optional session ID from X-Session-Id header
     
     Returns:
-        API Gateway response with chat response
+        ChatResponse with AI-generated response and scheme recommendations
     """
-    # Get correlation ID from event (added by handle_exceptions decorator)
-    correlation_id = event.get('correlationId')
+    # Get correlation ID from request state (set by middleware)
+    correlation_id = getattr(request.state, 'correlation_id', None)
     
-    # Parse and validate request
-    body = parse_request_body(event)
+    # Extract source IP for rate limiting
+    source_ip = request.client.host if request.client else 'unknown'
+    
+    # Check rate limit
+    rate_limit_response = check_rate_limit(source_ip)
+    if rate_limit_response:
+        return rate_limit_response
     
     # Sanitize and validate inputs
-    message = sanitize_input(body.get('message', ''), max_length=1000)
-    language = body.get('language', 'en')
-    if language:
-        language = validate_language_code(language)
-    
-    # Create validated request
-    request = ChatRequest(message=message, language=language)
+    try:
+        message = sanitize_input(chat_request.message, max_length=1000)
+        language = chat_request.language or 'en'
+        if language:
+            language = validate_language_code(language)
+    except ValueError as e:
+        error_body = {
+            'error': 'ValidationError',
+            'message': str(e),
+            'timestamp': get_current_timestamp()
+        }
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=error_body
+        )
     
     # Get or create session ID
-    session_id = get_session_id_from_event(event) or generate_session_id()
+    session_id = x_session_id or generate_session_id()
     
     # Get DynamoDB table
     table = get_dynamodb_table()
@@ -208,14 +224,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     schemes_db = get_relevant_schemes(table, limit=15)
     
     # Detect language if not provided
-    if not request.language or request.language == 'en':
-        detected_language = detect_language(request.message)
-        request.language = detected_language
+    if not language or language == 'en':
+        detected_language = detect_language(message)
+        language = detected_language
     
     # Translate to English if needed
-    english_message = request.message
-    if request.language != 'en':
-        english_message = translate_text(request.message, request.language, 'en', correlation_id)
+    english_message = message
+    if language != 'en':
+        english_message = translate_text(message, language, 'en', correlation_id)
     
     # Build prompt with context and scheme database
     prompt = build_prompt(english_message, session_context, schemes_db)
@@ -228,18 +244,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     # Translate response back to user language
     translated_response = ai_response
-    if request.language != 'en':
-        translated_response = translate_text(ai_response, 'en', request.language, correlation_id)
+    if language != 'en':
+        translated_response = translate_text(ai_response, 'en', language, correlation_id)
     
     # Store message in session
-    store_message(table, session_id, request.message, request.language, 'user')
+    store_message(table, session_id, message, language, 'user')
     
     # Extract scheme IDs for storage
     scheme_ids = [s.id for s in schemes]
-    store_message(table, session_id, translated_response, request.language, 'assistant', scheme_ids)
+    store_message(table, session_id, translated_response, language, 'assistant', scheme_ids)
     
     # Update session metadata
-    update_session_metadata(table, session_id, request.language)
+    update_session_metadata(table, session_id, language)
     
     # Get session expiration info
     session_info = get_session_info(session_id)
@@ -247,14 +263,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Create response
     response = ChatResponse(
         response=translated_response,
-        language=request.language,
+        language=language,
         schemes=schemes,
         sessionId=session_id,
         sessionExpiring=session_info.get('showWarning', False),
         sessionTimeRemaining=session_info.get('timeRemaining')
     )
     
-    return create_response(200, response.dict())
+    return response.dict()
 
 
 def get_session_context(table, session_id: str) -> list:
@@ -282,7 +298,7 @@ def get_session_context(table, session_id: str) -> list:
 
 def get_relevant_schemes(table, category: str = None, limit: int = 10) -> list:
     """
-    Retrieve relevant schemes from DynamoDB with Lambda memory caching.
+    Retrieve relevant schemes from DynamoDB with memory caching.
     
     Args:
         table: DynamoDB table resource
@@ -381,7 +397,7 @@ def translate_text(text: str, source_lang: str, target_lang: str, correlation_id
     Returns:
         Translated text, or original text if translation fails
     """
-    from shared.utils import log_api_call, log_performance_metric
+    from shared.utils import log_api_call
     
     if source_lang == target_lang:
         return text
@@ -499,7 +515,7 @@ def call_bedrock(prompt: str, correlation_id: Optional[str] = None) -> str:
     Returns:
         AI-generated response text
     """
-    from shared.utils import log_token_usage, log_api_call, log_performance_metric
+    from shared.utils import log_token_usage, log_api_call
     
     bedrock_client = get_bedrock_client()
     model_id = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0')

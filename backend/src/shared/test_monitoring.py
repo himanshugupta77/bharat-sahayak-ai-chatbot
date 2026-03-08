@@ -546,6 +546,7 @@ class TestCorrelationID:
 class TestHandleExceptionsDecorator:
     """Test exception handling decorator with logging."""
     
+    @pytest.mark.skip(reason="handle_exceptions decorator removed during FastAPI migration - now using FastAPI exception handlers")
     def test_decorator_adds_correlation_id(self):
         """Test that decorator adds correlation ID to event."""
         @utils.handle_exceptions
@@ -566,6 +567,7 @@ class TestHandleExceptionsDecorator:
         response = test_handler(event, None)
         assert response['statusCode'] == 200
     
+    @pytest.mark.skip(reason="handle_exceptions decorator removed during FastAPI migration - now using FastAPI exception handlers")
     @patch('shared.utils.log_with_context')
     def test_decorator_logs_request_start(self, mock_log):
         """Test that decorator logs request start."""
@@ -594,6 +596,7 @@ class TestHandleExceptionsDecorator:
         assert 'POST' in first_call[0][1]
         assert '/chat' in first_call[0][1]
     
+    @pytest.mark.skip(reason="handle_exceptions decorator removed during FastAPI migration - now using FastAPI exception handlers")
     @patch('shared.utils.log_with_context')
     def test_decorator_logs_request_completion(self, mock_log):
         """Test that decorator logs request completion with duration."""
@@ -623,6 +626,7 @@ class TestHandleExceptionsDecorator:
         assert 'duration_ms' in last_call[1]
         assert last_call[1]['duration_ms'] >= 0  # Duration should be non-negative
     
+    @pytest.mark.skip(reason="handle_exceptions decorator removed during FastAPI migration - now using FastAPI exception handlers")
     @patch('shared.utils.log_with_context')
     def test_decorator_logs_errors(self, mock_log):
         """Test that decorator logs errors with stack traces."""
